@@ -169,6 +169,15 @@ export class AdminService {
   }
 
   private _buildStockItemRequestXML(): string {
+    // ✅ FIXED: Add date range so Tally computes real-time closing balance
+    const now = new Date();
+    const currentMonth = now.getMonth(); // 0-indexed (0=Jan, 3=Apr)
+    const currentYear = now.getFullYear();
+    // Financial year starts April 1st
+    const fyStartYear = currentMonth >= 3 ? currentYear : currentYear - 1;
+    const svFromDate = `${fyStartYear}0401`;
+    const svToDate = `${currentYear}${String(currentMonth + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+
     return `
   <ENVELOPE>
     <HEADER>
@@ -179,10 +188,14 @@ export class AdminService {
     </HEADER>
     <BODY>
       <DESC>
-        <STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>
+        <STATICVARIABLES>
+          <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+          <SVFROMDATE>${svFromDate}</SVFROMDATE>
+          <SVTODATE>${svToDate}</SVTODATE>
+        </STATICVARIABLES>
         <TDL>
           <TDLMESSAGE>
-            <COLLECTION NAME="Stock Items">
+            <COLLECTION NAME="Stock Items" ISINITIALIZE="Yes">
               <TYPE>StockItem</TYPE>
               <FETCH>
                 GUID,
@@ -193,6 +206,7 @@ export class AdminService {
                 OPENINGVALUE,
                 CLOSINGBALANCE,
                 CLOSINGVALUE,
+                CLOSINGRATE,
                 STANDARDCOST,
                 HSN,
                 GSTAPPLICABLE,

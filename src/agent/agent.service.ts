@@ -457,10 +457,30 @@ export class AgentService {
 
     const agent = await this.agentModel.findOne({ tokenHash }).lean();
     if (!agent) throw new UnauthorizedException('Invalid token');
+
+    // Update agent lastSeen on every interaction
+    await this.agentModel.updateOne(
+      { tokenHash },
+      { $set: { lastSeen: new Date() } },
+    );
   
     const task = await this.agentTaskModel.findOne({ requestId: dto.requestId });
-    if (!task || task.status !== 'IN_PROGRESS') {
-      throw new BadRequestException('Invalid or inactive requestId');
+    if (!task) {
+      throw new BadRequestException('Invalid requestId');
+    }
+
+    // Bug 5 fix: Idempotent — if task is already COMPLETED or FAILED, return the existing result
+    if (task.status === 'COMPLETED') {
+      this.logger.log(`Task ${dto.requestId} already COMPLETED — returning existing result`);
+      return { success: true, message: task.result || 'Sync already completed', requestId: dto.requestId };
+    }
+    if (task.status === 'FAILED') {
+      this.logger.log(`Task ${dto.requestId} already FAILED — returning existing error`);
+      return { success: true, message: task.error || 'Sync previously failed', requestId: dto.requestId };
+    }
+    if (task.status !== 'IN_PROGRESS') {
+      // PENDING status — shouldn't happen normally, but allow it
+      this.logger.warn(`Task ${dto.requestId} is in ${task.status} status — proceeding anyway`);
     }
 
     if (dto.error) {
@@ -526,15 +546,16 @@ export class AgentService {
     // ✅ CHANGE: Task document mein result field ko properly handle karo
     await this.agentTaskModel.updateOne(
       { _id: task._id },
-      { 
+      {
         status: 'COMPLETED',
         result: processResult.message // ✅ Yeh ab work karega
       }
     );
   
-    return { 
-      success: true, 
-      message: processResult.message 
+    return {
+      success: true,
+      message: processResult.message,
+      requestId: dto.requestId,
     };
   }
 
@@ -620,8 +641,13 @@ export class AgentService {
   
     const tokenHash = crypto.createHash('sha256').update(authToken).digest('hex');
     const existing = await this.agentModel.findOne({ tokenHash }).lean();
-  
+   
     if (existing) {
+      // Update lastSeen on re-registration so agent shows online immediately
+      await this.agentModel.updateOne(
+        { tokenHash },
+        { $set: { lastSeen: new Date(), port: tallyPort, name: name || existing.name } },
+      );
       return { agentId: existing.agentId, backendUrl };
     }
   
@@ -649,6 +675,41 @@ export class AgentService {
 
     if (port < 9000 || port > 10000) {
       throw new BadRequestException('Invalid port number');
+    }
+
+    // Bug 4 fix: Check agent health (lastSeen within last 5 minutes)
+    const FIVE_MINUTES = 5 * 60 * 1000;
+    const timeSinceLastSeen = Date.now() - (agent.lastSeen?.getTime() || 0);
+    if (timeSinceLastSeen > FIVE_MINUTES) {
+      const lastSeenStr = agent.lastSeen
+        ? new Date(agent.lastSeen).toLocaleTimeString()
+        : 'never';
+      throw new BadRequestException(
+        `Agent is offline. Last seen: ${lastSeenStr}. Please ensure the TallySync Agent desktop app is running.`,
+      );
+    }
+
+    // Bug 3 fix: Prevent duplicate tasks for same agent + company
+    const existingTask = await this.agentTaskModel.findOne({
+      agentId: agent.agentId,
+      'payload.companyName': companyName,
+      status: { $in: ['PENDING', 'IN_PROGRESS'] },
+    });
+    if (existingTask) {
+      this.logger.log(
+        `Duplicate task prevented: ${companyName} already has a ${existingTask.status} task (${existingTask.requestId})`,
+      );
+      return {
+        success: true,
+        requestId: existingTask.requestId,
+        message: `A sync task for "${companyName}" is already ${existingTask.status === 'IN_PROGRESS' ? 'being processed' : 'queued'}. Reusing existing task.`,
+        command: {
+          requestId: existingTask.requestId,
+          action: existingTask.action,
+          payload: existingTask.payload,
+          signature: '',
+        },
+      };
     }
 
     const requestId = uuidv4();
@@ -681,24 +742,38 @@ export class AgentService {
     const agent = await this.agentModel.findOne({ tokenHash }).lean();
     if (!agent) throw new UnauthorizedException('Invalid token');
 
-    const task = await this.agentTaskModel
-      .findOne({ agentId: agent.agentId, status: 'PENDING' })
-      .sort({ createdAt: 1 });
+    // Update lastSeen on every poll
+    await this.agentModel.updateOne(
+      { tokenHash },
+      { $set: { lastSeen: new Date() } },
+    );
 
-    if (!task) return { task: null };
+    // Bug 6 fix: Return up to 5 PENDING tasks at once (was only 1)
+    const MAX_TASKS_PER_POLL = 5;
+    const tasks = await this.agentTaskModel
+      .find({ agentId: agent.agentId, status: 'PENDING' })
+      .sort({ createdAt: 1 })
+      .limit(MAX_TASKS_PER_POLL);
 
-    task.status = 'IN_PROGRESS';
-    await task.save();
+    if (!tasks || tasks.length === 0) return { tasks: [] };
 
     const secret = process.env.AGENT_HMAC_SECRET || 'default-secret';
-    const payload = {
-      requestId: task.requestId,
-      action: task.action,
-      payload: task.payload,
-    };
-    const signature = signPayload(payload, secret);
+    const taskList: any[] = [];
 
-    return { task: { ...payload, signature } };
+    for (const task of tasks) {
+      task.status = 'IN_PROGRESS';
+      await task.save();
+
+      const payload = {
+        requestId: task.requestId,
+        action: task.action,
+        payload: task.payload,
+      };
+      const signature = signPayload(payload, secret);
+      taskList.push({ ...payload, signature });
+    }
+
+    return { tasks: taskList };
   }
 
   // ✅ ADD: New methods for controller access
@@ -712,6 +787,48 @@ export class AgentService {
       .select('agentId name port lastSeen')
       .sort({ lastSeen: -1 })
       .lean();
+  }
+
+  /**
+   * Bug 1 fix: Get task status by requestId so the frontend can poll for real results.
+   */
+  async getTaskStatus(requestId: string) {
+    const task = await this.agentTaskModel
+      .findOne({ requestId })
+      .select('requestId status result error createdAt updatedAt')
+      .lean();
+    if (!task) throw new NotFoundException('Task not found');
+    return task;
+  }
+
+  /**
+   * Bug 2 fix: Check agent health via lastSeen timestamp.
+   * Uses userid (stable across JWT refreshes) to find all agents for this user.
+   * Returns online=true if ANY agent has been seen within the last 2 minutes.
+   */
+  async checkAgentHealth(userid: string) {
+    const agents = await this.agentModel.find({ userid }).lean();
+    if (!agents || agents.length === 0) {
+      return { online: false, agents: [], reason: 'No agents registered' };
+    }
+
+    const TWO_MINUTES = 2 * 60 * 1000;
+    const results = agents.map((agent) => {
+      const timeSinceLastSeen = Date.now() - (agent.lastSeen?.getTime() || 0);
+      const online = timeSinceLastSeen <= TWO_MINUTES;
+      return {
+        online,
+        lastSeen: agent.lastSeen,
+        agentId: agent.agentId,
+        name: agent.name,
+      };
+    });
+
+    // Overall: online if any agent is online
+    return {
+      online: results.some((r) => r.online),
+      agents: results,
+    };
   }
 
   

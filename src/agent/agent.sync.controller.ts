@@ -1,16 +1,18 @@
-import { 
-  Controller, 
-  Get, 
-  Post, 
-  Body, 
-  Query, 
-  Headers, 
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Query,
+  Headers,
+  Param,
   BadRequestException,
   UsePipes,
   ValidationPipe,
   UseGuards,
   Req
 } from '@nestjs/common';
+import * as crypto from 'crypto';
 import { AgentService } from './agent.service';
 import { RegisterAgentDto } from './dto/register-agent.dto';
 import { CreateTaskDto } from './dto/create-task.dto';
@@ -126,5 +128,37 @@ export class AgentSyncController {
     const agents = await this.agentService.getUserAgents(userid);
     
     return { agents };
+  }
+
+  /** Bug 1 fix: Get task status by requestId — frontend polls this for real results */
+  @Get('task-status/:requestId')
+  async getTaskStatus(@Param('requestId') requestId: string) {
+    if (!requestId) {
+      throw new BadRequestException('requestId required');
+    }
+    return this.agentService.getTaskStatus(requestId);
+  }
+
+  /** Bug 2 fix: Real agent health check via lastSeen timestamp (uses userid from JWT, not agent tokenHash) */
+  @Get('agent-health')
+  async checkAgentHealth(@Headers('authorization') authHeader: string) {
+    const token = authHeader?.startsWith('Bearer ')
+      ? authHeader.split(' ')[1]
+      : null;
+    if (!token) {
+      throw new BadRequestException('Missing or invalid Authorization header');
+    }
+    // Decode JWT to get userid — this is the admin user's ID, stable across login sessions
+    let userid: string;
+    try {
+      const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+      userid = payload.userid || payload.id;
+    } catch {
+      throw new BadRequestException('Invalid JWT token');
+    }
+    if (!userid) {
+      throw new BadRequestException('Could not extract userid from token');
+    }
+    return this.agentService.checkAgentHealth(userid);
   }
 }

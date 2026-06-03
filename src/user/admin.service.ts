@@ -140,6 +140,42 @@ export class AdminService {
     return String(value).replace(/\u0004/g, '').trim();
   };
 
+  /**
+   * Extract SKU from a raw Tally stock item using the SAME priority as _processTallyItem.
+   * Priority: PARTNO → NAME → GUID
+   */
+  private _extractSkuFromRawItem(item: any): string {
+    // PARTNO
+    let partNo = '';
+    if (item.$?.PARTNO) partNo = this._cleanTallyString(item.$.PARTNO);
+    if (!partNo) {
+      const partNoObj = item.PARTNO || item.PARTNO_x0020_ || item.PARTNUMBER;
+      if (partNoObj) partNo = this._cleanTallyString(partNoObj);
+    }
+    if (!partNo) {
+      const aliasObj = item.ALIAS || item.ALIAS_x0020_;
+      if (aliasObj) partNo = this._cleanTallyString(aliasObj);
+    }
+
+    // NAME
+    let name = '';
+    if (item.$?.NAME) name = this._cleanTallyString(item.$.NAME);
+    if (!name) {
+      const nameObj = item.NAME || item.MAILINGNAME;
+      if (nameObj) name = this._cleanTallyString(nameObj);
+    }
+
+    // GUID
+    let guid = '';
+    if (item.$?.GUID) guid = this._cleanTallyString(item.$.GUID);
+    if (!guid) {
+      const guidObj = item.GUID || item.REMOTEID;
+      if (guidObj) guid = this._cleanTallyString(guidObj);
+    }
+
+    return partNo || name || guid || '';
+  }
+
   private _buildCompanyRequestXML(): string {
     return `
   <ENVELOPE>
@@ -184,7 +220,7 @@ export class AdminService {
       <VERSION>1</VERSION>
       <TALLYREQUEST>Export</TALLYREQUEST>
       <TYPE>Collection</TYPE>
-      <ID>Stock Items</ID>
+      <ID>TallySyncStockItemsCollection</ID>
     </HEADER>
     <BODY>
       <DESC>
@@ -195,25 +231,22 @@ export class AdminService {
         </STATICVARIABLES>
         <TDL>
           <TDLMESSAGE>
-            <COLLECTION NAME="Stock Items" ISINITIALIZE="Yes">
+            <COLLECTION NAME="TallySyncStockItemsCollection" ISINITIALIZE="Yes">
               <TYPE>StockItem</TYPE>
-              <FETCH>
-                GUID,
-                NAME,
-                PARENT,
-                BASEUNITS,
-                OPENINGBALANCE,
-                OPENINGVALUE,
-                CLOSINGBALANCE,
-                CLOSINGVALUE,
-                CLOSINGRATE,
-                STANDARDCOST,
-                HSN,
-                GSTAPPLICABLE,
-                DESCRIPTION,
-                PARTNO,
-                USERDEFINEDFIELDLIST
-              </FETCH>
+              <NATIVEMETHOD>GUID</NATIVEMETHOD>
+              <NATIVEMETHOD>NAME</NATIVEMETHOD>
+              <NATIVEMETHOD>PARENT</NATIVEMETHOD>
+              <NATIVEMETHOD>BASEUNITS</NATIVEMETHOD>
+              <NATIVEMETHOD>OPENINGBALANCE</NATIVEMETHOD>
+              <NATIVEMETHOD>OPENINGVALUE</NATIVEMETHOD>
+              <NATIVEMETHOD>CLOSINGBALANCE</NATIVEMETHOD>
+              <NATIVEMETHOD>CLOSINGVALUE</NATIVEMETHOD>
+              <NATIVEMETHOD>CLOSINGRATE</NATIVEMETHOD>
+              <NATIVEMETHOD>STANDARDCOST</NATIVEMETHOD>
+              <NATIVEMETHOD>HSN</NATIVEMETHOD>
+              <NATIVEMETHOD>GSTAPPLICABLE</NATIVEMETHOD>
+              <NATIVEMETHOD>DESCRIPTION</NATIVEMETHOD>
+              <NATIVEMETHOD>PARTNO</NATIVEMETHOD>
             </COLLECTION>
           </TDLMESSAGE>
         </TDL>
@@ -482,7 +515,10 @@ async syncTallyProducts(
   if (stockItemsToProcess.length === 0)
     return { success: true, message: 'Sync complete: Company validated, but no stock items found.' };
 
-  const allSkus = stockItemsToProcess.map((si) => this._cleanTallyString(si.$?.GUID ?? si.$?.NAME ?? '')).filter(Boolean);
+  // ✅ FIX: Use the SAME SKU extraction logic as _processTallyItem (PARTNO → NAME → GUID)
+  const allSkus = stockItemsToProcess
+    .map((si) => this._extractSkuFromRawItem(si))
+    .filter(Boolean);
 
   //Fetch existing products from DB
   const existingProducts = await this.productModel.find({ sku: { $in: allSkus }, party_id }).select('sku product_id').lean();
@@ -501,9 +537,12 @@ async syncTallyProducts(
         productId = await this._peekNextProductId();
         product.product_id = productId;
 
+        // ✅ FIX: Use $set (not $setOnInsert) so that even if the SKU lookup
+        // missed an existing product (edge case), it still gets updated with
+        // the latest data from Tally.
         const inserted = await this.productModel.updateOne(
           { sku: product.sku, party_id },
-          { $setOnInsert: product },
+          { $set: { ...product, tally_account: {} } },
           { upsert: true },
         );
 
@@ -511,7 +550,7 @@ async syncTallyProducts(
         skuToProductIdMap.set(product.sku, productId);
       } else {
         product.product_id = productId;
-        // Update price/stock for existing
+        // ✅ Update ALL fields (price, stock, name, etc.) for existing product
         await this.productModel.updateOne(
           { sku: product.sku, party_id },
           { $set: { ...product, tally_account: {} } }

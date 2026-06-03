@@ -100,6 +100,44 @@ export class AgentService {
     return String(value).replace(/\u0004/g, '').trim();
   };
 
+  /**
+   * Extract SKU from a raw Tally stock item using the SAME priority as _processTallyItem.
+   * This ensures the DB lookup for existing products matches the actual SKU derivation.
+   * Priority: PARTNO → NAME → GUID
+   */
+  private _extractSkuFromRawItem(item: any): string {
+    // PARTNO
+    let partNo = '';
+    if (item.$?.PARTNO) partNo = this._cleanTallyString(item.$.PARTNO);
+    if (!partNo) {
+      const partNoObj = item.PARTNO || item.PARTNO_x0020_ || item.PARTNUMBER;
+      if (partNoObj) partNo = this._cleanTallyString(partNoObj);
+    }
+    if (!partNo) {
+      // Try ALIAS as fallback for part number
+      const aliasObj = item.ALIAS || item.ALIAS_x0020_;
+      if (aliasObj) partNo = this._cleanTallyString(aliasObj);
+    }
+
+    // NAME
+    let name = '';
+    if (item.$?.NAME) name = this._cleanTallyString(item.$.NAME);
+    if (!name) {
+      const nameObj = item.NAME || item.MAILINGNAME;
+      if (nameObj) name = this._cleanTallyString(nameObj);
+    }
+
+    // GUID
+    let guid = '';
+    if (item.$?.GUID) guid = this._cleanTallyString(item.$.GUID);
+    if (!guid) {
+      const guidObj = item.GUID || item.REMOTEID;
+      if (guidObj) guid = this._cleanTallyString(guidObj);
+    }
+
+    return partNo || name || guid || '';
+  }
+
   private _extractTallyValue(
     item: any,
     possibleKeys: string[],
@@ -308,9 +346,11 @@ export class AgentService {
         return { success: true, message: 'Sync complete: No stock items found.' };
       }
 
-      const allSkus = stockItems.map((si) => 
-        this._cleanTallyString(si.$?.GUID ?? si.$?.NAME ?? '')
-      ).filter(Boolean);
+      // ✅ FIX: Use the SAME SKU extraction logic as _processTallyItem (PARTNO → NAME → GUID)
+      // so that the DB lookup for existing products correctly matches the derived SKU.
+      const allSkus = stockItems
+        .map((si) => this._extractSkuFromRawItem(si))
+        .filter(Boolean);
 
       // Fetch existing products
       const existingProducts = await this.productModel.find({ 
@@ -393,9 +433,9 @@ export class AgentService {
 
       this.logger.log(`Batch process complete.`);
 
-      return { 
-        success: true, 
-        message: `Sync successful. Processed ${itemsToProcess.length} items. New: ${newSkus.length}` 
+      return {
+        success: true,
+        message: `Sync successful. Processed ${itemsToProcess.length} items. New: ${newSkus.length}, Updated: ${itemsToProcess.length - newSkus.length}`
       };
 
     } catch (error: any) {

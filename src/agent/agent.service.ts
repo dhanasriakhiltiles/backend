@@ -748,7 +748,26 @@ export class AgentService {
       { $set: { lastSeen: new Date() } },
     );
 
-    // Bug 6 fix: Return up to 5 PENDING tasks at once (was only 1)
+    // Recover stale IN_PROGRESS tasks — if the agent crashed/restarted while
+    // processing a task, it stays IN_PROGRESS forever. Reset any that are
+    // older than 5 minutes back to PENDING so the agent can retry them.
+    const STALE_THRESHOLD_MS = 5 * 60 * 1000;
+    const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS);
+    const staleResult = await this.agentTaskModel.updateMany(
+      {
+        agentId: agent.agentId,
+        status: 'IN_PROGRESS',
+        updatedAt: { $lt: staleCutoff },
+      },
+      { $set: { status: 'PENDING' } },
+    );
+    if (staleResult.modifiedCount > 0) {
+      this.logger.warn(
+        `Recovered ${staleResult.modifiedCount} stale IN_PROGRESS task(s) → reset to PENDING`,
+      );
+    }
+
+    // Return up to 5 PENDING tasks at once
     const MAX_TASKS_PER_POLL = 5;
     const tasks = await this.agentTaskModel
       .find({ agentId: agent.agentId, status: 'PENDING' })

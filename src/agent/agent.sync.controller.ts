@@ -18,10 +18,11 @@ import { RegisterAgentDto } from './dto/register-agent.dto';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { ReceiveTallyDto } from './dto/receive-tally.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
-import { ThrottlerGuard } from '@nestjs/throttler';
+import { ThrottlerGuard, Throttle } from '@nestjs/throttler';
 
 @Controller('agent/sync')
 @UseGuards(ThrottlerGuard)
+@Throttle({ default: { limit: 60, ttl: 60000 } })
 @UsePipes(new ValidationPipe())
 export class AgentSyncController {
   constructor(private readonly agentService: AgentService) {}

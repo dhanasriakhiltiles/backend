@@ -253,8 +253,7 @@ export class ProductController {
 
   @Post('update/:product_id')
   @UseGuards(AuthGuard('jwt'))
-  async updateProduct(@Body() changes: any, @Req() req) {
-    const productId = req.params.product_id;
+  async updateProduct(@Param('product_id') productId: string, @Body() changes: any) {
     return this.productService.updateProduct(productId, changes);
   }
 

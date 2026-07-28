@@ -58,9 +58,15 @@ export class Product {
   @Prop({ required: true, index: true })
   party_id: string; // Link product to party who owns/registered it
 
+  @Prop()
+  video_url?: string;
+
 
   @Prop({ default: Date.now })
   created_at?: Date;
+
+  @Prop()
+  updated_at?: Date;
 
   @Prop({ type: Object, default: () => ({}) })
   tally_account?: {

@@ -7,6 +7,7 @@ import { UserService } from 'src/user/user.service';
 import { Inventory, InventoryDocument } from './schemas/inventory.schema';
 import { Offer } from './schemas/offer.schema';
 import { OfferService } from './offer.service';
+import { PreOrderService } from './preorder.service';
 import { Retailerfield } from '../user/schemas/retailerfields.schema';
 
 @Injectable()
@@ -16,6 +17,7 @@ export class ProductService {
             private readonly UserService: UserService,
             @InjectModel(Inventory.name) private inventoryModel: Model<Inventory>,
             private readonly offerService: OfferService,
+            private readonly preOrderService: PreOrderService,
             @InjectModel(Retailerfield.name) private retailerfieldModel: Model<Retailerfield>) {}
 
   async addproduct(data: any): Promise<Product> {
@@ -78,12 +80,20 @@ export class ProductService {
   async getAdminProducts(docid): Promise<any> {
     const userid = await this.UserService.finduseridbydocumentid(docid);
     const partyid = await this.UserService.findpartyidbyuserid(userid);
-    const adminprod = await this.productModel.find({party_id : partyid}).select('product_id name sku brand short_description long_description dimensions images category subcategory specification attributes price' )
+    const adminprod = await this.productModel.find({party_id : partyid}).select('product_id name sku brand short_description long_description dimensions images category subcategory specification attributes price video_url updated_at' )
     const adminproducts = await Promise.all(adminprod.map(async (product) => {
       const inventory = await this.inventoryModel.findOne({
         product_id:  product.product_id,});
       // Fetch active offers for this product
       const offers = await this.offerService.getActiveOffersForProduct(product.product_id);
+
+      // Fetch active pre-orders for this product
+      const preOrders = await this.preOrderService.getActivePreOrdersForProduct(product.product_id);
+      const totalPreOrderQty = preOrders.reduce((sum, po) => sum + (po.quantity || 0), 0);
+      const showQuantity = preOrders.some(po => po.show_quantity);
+      const hasPreOrder = preOrders.length > 0;
+      const inventoryQty = inventory?.quantity || 0;
+      const availableQty = Math.max(0, inventoryQty - totalPreOrderQty);
 
       return {
         product_id: product.product_id,
@@ -99,8 +109,18 @@ export class ProductService {
         specification : product.specification,
         attributes : product.attributes,
         price: product.price,
+        video_url: (product as any).video_url,
+        updated_at: (product as any).updated_at,
         inventory: inventory ,
         offers, // Attach offers array (could be empty)
+        preOrder: hasPreOrder ? {
+          totalQuantity: totalPreOrderQty,
+          showQuantity: showQuantity,
+          availableQuantity: availableQty,
+          hasHighlight: true,
+          badgeText: preOrders.find(po => po.badge_text)?.badge_text || 'Trending',
+          entries: preOrders, // Admin sees all entries
+        } : null,
       };
     }));
     
@@ -116,9 +136,11 @@ export class ProductService {
     // Fetch retailer field visibility
     const retailerFields = await this.retailerfieldModel.findOne({ userid: user.userid });
     
+    let allowedFields: string[] = [];
+    
     if (!retailerFields) {
       retailerProd = await this.productModel.find({ party_id: partyid })
-        .select('product_id name sku brand short_description long_description dimensions images category subcategory specification attributes price tally_account');
+        .select('product_id name sku brand short_description long_description dimensions images category subcategory specification attributes price tally_account video_url updated_at');
     }else{
 
     let tallyAccounts: string[] = ['all'];
@@ -127,8 +149,10 @@ export class ProductService {
     }
 
     // Get allowed fields from retailerFields.fields, always include product_id
-    let allowedFields = Array.isArray(retailerFields?.fields) ? retailerFields.fields.slice() : [];
+    allowedFields = Array.isArray(retailerFields?.fields) ? retailerFields.fields.slice() : [];
     if (!allowedFields.includes('product_id')) allowedFields.unshift('product_id');
+    if (!allowedFields.includes('video_url')) allowedFields.push('video_url');
+    if (!allowedFields.includes('updated_at')) allowedFields.push('updated_at');
     const selectFields = allowedFields.join(' ');
 
     // If tally_account is 'all', return all products for the party
@@ -147,11 +171,58 @@ export class ProductService {
   const offers = await this.offerService.getActiveOffersForRetailer(user.userid);
   const retailerproducts = await Promise.all(retailerProd.map(async (product) => {
     const inventory = await this.inventoryModel.findOne({product_id:  product.product_id,});
-    
-    
-    return {product:product,
-      inventory,
-      
+
+    // Clean up product fields
+    const plainProduct = product.toObject ? product.toObject() : product;
+    if (retailerFields) {
+      Object.keys(plainProduct).forEach(key => {
+        const preserveKeys = ['product_id', 'video_url', 'updated_at', 'images', '_id', '__v'];
+        if (!preserveKeys.includes(key) && !allowedFields.includes(key)) {
+          delete plainProduct[key];
+        }
+      });
+    }
+
+    // Clean up inventory fields
+    let filteredInventory: any = null;
+    if (inventory) {
+      const plainInv = inventory.toObject ? inventory.toObject() : inventory;
+      if (retailerFields) {
+        Object.keys(plainInv).forEach(key => {
+          const preserveInvKeys = ['product_id', '_id', '__v'];
+          if (!preserveInvKeys.includes(key) && !allowedFields.includes(key)) {
+            delete plainInv[key];
+          }
+        });
+        // Check if any inventory fields are allowed
+        if (allowedFields.includes('quantity') || allowedFields.includes('batch_no') || allowedFields.includes('expiry_date')) {
+          filteredInventory = plainInv;
+        }
+      } else {
+        filteredInventory = plainInv;
+      }
+    }
+
+    // Fetch active pre-orders for this product
+    const preOrders = await this.preOrderService.getActivePreOrdersForProduct(product.product_id);
+    const totalPreOrderQty = preOrders.reduce((sum, po) => sum + (po.quantity || 0), 0);
+    const showQuantity = preOrders.some(po => po.show_quantity);
+    const hasPreOrder = preOrders.length > 0;
+    const inventoryQty = (filteredInventory && filteredInventory.quantity) ? filteredInventory.quantity : 0;
+    const availableQty = Math.max(0, inventoryQty - totalPreOrderQty);
+
+    return {
+      product: plainProduct,
+      inventory: filteredInventory,
+      // Retailer sees: available qty (always reduced), highlight (always if pre-order exists),
+      // quantity number ONLY if toggle is ON (showQuantity)
+      preOrder: hasPreOrder ? {
+        totalQuantity: showQuantity ? totalPreOrderQty : null,
+        showQuantity: showQuantity,
+        availableQuantity: availableQty,
+        hasHighlight: true,
+        badgeText: preOrders.find(po => po.badge_text)?.badge_text || 'Trending',
+      } : null,
     };
   }));
 
@@ -301,6 +372,13 @@ async deleteProduct(productId: string): Promise<any> {
     await this.offerService.deleteOffersByProductId?.(productId);
   } catch (error) {
     console.warn('Could not delete associated offers:', error);
+  }
+
+  // Also delete associated pre-orders if they exist
+  try {
+    await this.preOrderService.deletePreOrdersByProductId(productId);
+  } catch (error) {
+    console.warn('Could not delete associated pre-orders:', error);
   }
 
   return {

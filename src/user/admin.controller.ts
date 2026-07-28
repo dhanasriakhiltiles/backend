@@ -191,7 +191,7 @@ async syncTallyProducts(
     }
     const updates = Object.entries(fieldVisibility).map(async ([retailerId, fieldsObj]: [string, any]) => {
       const fields = Object.entries(fieldsObj)
-        .filter(([field, checked]) => field !== 'tally_account' && checked === true)
+        .filter(([field, checked]) => field !== 'tally_account' && (field === 'product_id' || checked === true))
         .map(([field]) => field);
       let tally_account = fieldsObj.tally_account;
       if (!tally_account || tally_account.length === 0) tally_account = ['all'];

@@ -69,7 +69,12 @@ async saveCustomCategories(@Req() req, @Body() body) {
 @Get('custom-categories')
 @UseGuards(JwtAuthGuard)
 async getCustomCategories(@Req() req) {
-  return this.categoryService.getUserCategories(req.user.userid);
+  const retailer = await this.userModel.findOne({ userid: req.user.userid }).select('adminid');
+  const adminId = retailer?.adminid || req.user.adminid;
+  if (!adminId) {
+    return [];
+  }
+  return this.categoryService.getUserCategories(adminId);
 }
 
 @Delete('custom-categories')
